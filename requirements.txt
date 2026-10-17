@@ -1,0 +1,14 @@
+# Cliente oficial de Ollama (>=0.4 permite pasar un JSON Schema en "format")
+ollama>=0.4.0
+# Validación estricta de la respuesta del modelo
+pydantic>=2.0,<3
+# Tabla de resultados / informe en Excel
+pandas>=2.0
+# Motor que pandas necesita para escribir .xlsx (dependencia de to_excel)
+openpyxl>=3.1
+# Leer .docx y generar el informe en Word
+python-docx>=1.1
+# Leer .pdf
+pypdf>=4.0
+# Convierte páginas de PDF escaneados en imagen (para el modelo de visión)
+pymupdf>=1.24.3
