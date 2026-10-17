@@ -1,114 +1,69 @@
-"""
-main.py - Orquestador del flujo completo.
-
-    entrada/*.pdf|docx|txt  ->  extraer texto  ->  Ollama (JSON)  ->  validar (Pydantic)
-                            ->  renombrar y mover a salida/<Categoria>/  ->  informe Excel/Word
-
-Uso (desde la carpeta del proyecto):
-    python main.py
-"""
-import logging
-import sys
-import time
+from datetime import datetime
 from pathlib import Path
+from config import CARPETA_ENTRADA, CARPETA_SALIDA
+from extractor import extraer_contenido
+from ia import clasificar_documento
+from organizer import guardar_archivo, actualizar_informe
 
-from config import CARPETA_ENTRADA, CARPETA_SALIDA, EXTENSIONES_SOPORTADAS, MODELO, MODELO_VISION
-from extractor import ExtraccionError, SinTextoError, extraer_texto, renderizar_paginas_pdf
-from ia_client import (
-    ErrorIA,
-    OllamaNoDisponible,
-    clasificar_documento,
-    clasificar_imagenes,
-    verificar_ollama,
-)
-from organizer import actualizar_informe, organizar_archivo, registro_error, registro_ok
-
-logger = logging.getLogger("main")
-
-
-def listar_archivos() -> list[Path]:
-    """Archivos soportados de la carpeta de entrada (ignora temporales '~$' que crea Word)."""
-    return sorted(
-        p
-        for p in CARPETA_ENTRADA.iterdir()
-        if p.is_file()
-        and p.suffix.lower() in EXTENSIONES_SOPORTADAS
-        and not p.name.startswith("~$")
-    )
-
-
-def clasificar_archivo(ruta: Path):
-    """Texto -> modelo de texto. Si es un PDF sin texto (escaneo) -> modelo de visión."""
-    try:
-        return clasificar_documento(extraer_texto(ruta))
-    except SinTextoError:
-        logger.info("   PDF sin texto: se analizan las primeras páginas como imagen (%s)", MODELO_VISION)
-        return clasificar_imagenes(renderizar_paginas_pdf(ruta))
-
-
-def procesar_archivo(ruta: Path) -> dict:
-    """Procesa UN archivo y devuelve la fila del informe (OK o ERROR).
-
-    Un fallo en un documento no detiene el lote: se registra y se sigue con el siguiente.
-    Solo OllamaNoDisponible se propaga, porque sin servidor no tiene sentido continuar.
-    """
-    try:
-        resultado = clasificar_archivo(ruta)              # 1-2. leer + IA + validación Pydantic
-        destino = organizar_archivo(ruta, resultado)      # 3. renombrar y mover
-        logger.info("   -> %s / %s", resultado.categoria, destino.name)
-        return registro_ok(ruta, destino, resultado)
-    except OllamaNoDisponible:
-        raise
-    except (ExtraccionError, ErrorIA, OSError) as e:
-        logger.error("   -> ERROR: %s", e)
-        return registro_error(ruta, str(e))
-
-
-def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S"
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)  # oculta el ruido de cada petición HTTP
+def main():
     CARPETA_ENTRADA.mkdir(exist_ok=True)
     CARPETA_SALIDA.mkdir(exist_ok=True)
+    
+    archivos = [
+        p for p in CARPETA_ENTRADA.iterdir()
+        if p.is_file() and p.suffix.lower() in [".pdf", ".docx", ".txt"]
+    ]
 
-    archivos = listar_archivos()
     if not archivos:
-        logger.warning("No hay archivos PDF/DOCX/TXT en: %s", CARPETA_ENTRADA)
-        return 0
+        print("No se encontraron archivos en la carpeta 'entrada'.")
+        return
 
-    try:
-        verificar_ollama()  # falla rápido, antes de procesar nada
-    except ErrorIA as e:
-        logger.error("%s", e)
-        return 1
+    print(f"Archivos encontrados: {len(archivos)}\n")
+    registros = []
 
-    logger.info("Modelo: %s | Archivos a procesar: %d", MODELO, len(archivos))
-    inicio = time.perf_counter()
-    registros: list[dict] = []
+    for i, archivo in enumerate(archivos, start=1):
+        print(f"[{i}/{len(archivos)}] Procesando: {archivo.name}...")
+        
+        try:
+            contenido = extraer_contenido(archivo)
+            if contenido["tipo"] == "vacio":
+                raise ValueError("El archivo está vacío.")
+                
+            datos = clasificar_documento(contenido)
+            destino = guardar_archivo(archivo, datos)
+            
+            cat = datos.get("categoria", "Otro")
+            res = datos.get("resumen", "-")
+            clave = datos.get("datos_clave", "-")
+            fecha = datos.get("fecha_documento", "desconocida")
+            
+            registros.append({
+                "Fecha Proceso": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Archivo Original": archivo.name,
+                "Archivo Nuevo": destino.name,
+                "Categoría": cat,
+                "Resumen": res,
+                "Datos Clave": clave,
+                "Fecha Documento": fecha,
+                "Estado": "OK"
+            })
+            print(f"   -> Categoría: {cat} | Guardado como: {destino.name}")
 
-    try:
-        for i, ruta in enumerate(archivos, start=1):
-            logger.info("[%d/%d] %s", i, len(archivos), ruta.name)
-            registros.append(procesar_archivo(ruta))
-    except OllamaNoDisponible as e:
-        logger.error("%s Se detiene el proceso.", e)
-    except KeyboardInterrupt:
-        logger.warning("Interrumpido por el usuario (Ctrl+C).")
-    finally:
-        # Pase lo que pase, lo ya procesado queda guardado en el informe.
-        if registros:
-            rutas = actualizar_informe(registros)
-            correctos = sum(1 for r in registros if r["Estado"] == "OK")
-            logger.info(
-                "Terminado en %.1f s: %d correctos, %d con error.",
-                time.perf_counter() - inicio, correctos, len(registros) - correctos,
-            )
-            for ruta_informe in rutas:
-                logger.info("Informe: %s", ruta_informe)
+        except Exception as e:
+            print(f"   -> ERROR: {e}")
+            registros.append({
+                "Fecha Proceso": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Archivo Original": archivo.name,
+                "Archivo Nuevo": "-",
+                "Categoría": "-",
+                "Resumen": "-",
+                "Datos Clave": "-",
+                "Fecha Documento": "-",
+                "Estado": f"Error: {e}"
+            })
 
-    return 0
-
+    actualizar_informe(registros)
+    print("\nProceso terminado. Informe guardado en 'salida/informe_clasificacion.xlsx'.")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
